@@ -112,6 +112,69 @@ async def fetch(url: str, params: dict | None = None) -> str:
     return text
 
 
+async def _jump_to_articolo(numero: str, codice: str) -> tuple[str, str] | None:
+    """Segue il meccanismo 'vai all'articolo' del sito (POST /articolo.php con
+    "numero" e "codice"), verificato via browser il 29/09/2026: risponde con
+    un redirect diretto alla pagina canonica dell'articolo. Molto più
+    affidabile della ricerca testuale per riferimenti "art. N <fonte>".
+    Restituisce (url_finale, html) oppure None se il salto non porta a una
+    vera pagina di articolo (numero/codice non esistente in quella fonte)."""
+    global _last_request
+    if not await _allowed(config.ARTICOLO_JUMP_URL):
+        return None
+    async with _lock:
+        wait = config.MIN_INTERVAL - (time.monotonic() - _last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            r = await _client.post(
+                config.ARTICOLO_JUMP_URL, data={"numero": numero, "codice": codice}
+            )
+        finally:
+            _last_request = time.monotonic()
+    if r.status_code >= 400:
+        return None
+    final_url = str(r.url)
+    # Il salto fallito ricarica semplicemente la pagina del codice (niente
+    # "artNNN.html" nel percorso finale): lo trattiamo come "non trovato".
+    if not re.search(r"/art[\w-]*\.html", urlparse(final_url).path):
+        return None
+    return final_url, r.text
+
+
+_ART_RIFERIMENTO_RE = re.compile(
+    r"art(?:icol[oi])?\.?\s*(\d+\s*(?:bis|ter|quater|quinquies|sexies|septies|octies|novies|decies)?)"
+    r"\s+(?:del\s+|della\s+|dell[oa']\s*)?(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_codice(nome: str) -> str | None:
+    nome = _clean(nome).lower().rstrip(",;: ")
+    if nome in config.CODICE_MAP:
+        return config.CODICE_MAP[nome]
+    # riprova togliendo un eventuale punto finale (ma non i punti interni:
+    # servono per sigle come "c.c." o "t.u.p.i.")
+    return config.CODICE_MAP.get(nome.rstrip("."))
+
+
+async def _try_direct_jump(riferimento: str) -> tuple[str, str] | None:
+    """Se `riferimento` è del tipo 'art. 2043 codice civile', prova il salto
+    diretto via /articolo.php invece della ricerca testuale. Restituisce
+    (url, html) se riuscito, altrimenti None (si ricorre alla ricerca)."""
+    m = _ART_RIFERIMENTO_RE.match(_clean(riferimento))
+    if not m:
+        return None
+    numero, resto = m.group(1), m.group(2)
+    codice = _resolve_codice(resto)
+    if not codice:
+        return None
+    try:
+        return await _jump_to_articolo(numero, codice)
+    except httpx.HTTPError:
+        return None
+
+
 # ------------------------------------------------------------------- Parsing
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -421,16 +484,29 @@ async def leggi_articolo_brocardi(riferimento: str) -> dict:
     un tetto: il totale disponibile è sempre indicato).
 
     `riferimento` può essere:
-    - l'"url" di un articolo restituito da cerca_brocardi (consigliato: più
-      affidabile);
-    - un riferimento naturale in italiano, es. "art. 2043 codice civile" o
-      "statuto dei lavoratori art. 18": in questo caso viene prima cercato
-      su Brocardi.it e si legge il primo risultato pertinente.
+    - un riferimento naturale con numero e fonte, es. "art. 2043 codice
+      civile", "articolo 18 statuto dei lavoratori", "art. 2645 bis c.c."
+      (consigliato: risolto con un salto diretto e affidabile, non con la
+      ricerca testuale del sito, che per questo tipo di riferimento spesso
+      sbaglia articolo);
+    - l'"url" di un articolo restituito da cerca_brocardi;
+    - un riferimento più descrittivo senza numero (es. "responsabilità
+      extracontrattuale codice civile"): in questo caso viene cercato su
+      Brocardi.it e si legge il primo risultato pertinente - meno affidabile,
+      verifica sempre titolo e rubrica nel risultato.
     """
     riferimento = riferimento.strip()
+    url = None
+    html_text = None
+
     if _is_brocardi_url(riferimento):
         url = _abs_url(riferimento)
     else:
+        jump = await _try_direct_jump(riferimento)
+        if jump:
+            url, html_text = jump
+
+    if url is None:
         trovati = await _search(riferimento, "articoli", 1)
         risultati = trovati.get("per_categoria", {}).get("articoli", {}).get("risultati", [])
         if not risultati:
@@ -439,11 +515,22 @@ async def leggi_articolo_brocardi(riferimento: str) -> dict:
                 "suggerimento": "Prova con cerca_brocardi(area='articoli') usando termini diversi.",
             }
         url = risultati[0]["url"]
-    try:
-        html_text = await fetch(url)
-    except (httpx.HTTPError, PermissionError) as e:
-        return {"errore": f"Articolo non recuperabile: {e}", "url": url}
-    return _parse_article_page(html_text, url)
+        note_ricerca = (
+            "Risolto tramite ricerca testuale (non tramite salto diretto per numero "
+            "articolo): verifica titolo e rubrica nel risultato prima di usarlo."
+        )
+    else:
+        note_ricerca = None
+
+    if html_text is None:
+        try:
+            html_text = await fetch(url)
+        except (httpx.HTTPError, PermissionError) as e:
+            return {"errore": f"Articolo non recuperabile: {e}", "url": url}
+    res = _parse_article_page(html_text, url)
+    if note_ricerca:
+        res["nota_risoluzione"] = note_ricerca
+    return res
 
 
 @mcp.tool()
